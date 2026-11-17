@@ -1,0 +1,62 @@
+# Shield Dev Radar: análisis de seguridad en cada push y pull request.
+# Guardar en: .github/workflows/shield-radar.yml
+# SHIELD_KEY (y NVD_API_KEY, opcional) van como secretos del repositorio: Settings → Secrets and variables → Actions.
+# Cada secreto llega solo al paso que lo usa. Las acciones van fijadas por SHA (la versión, en el comentario).
+name: Shield Dev Radar
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  seguridad:
+    runs-on: ubuntu-latest
+    env:
+      SHIELD_URL: https://platform.shielddev.com.ar
+      SHIELD_WORKSPACE: agro-norte
+      SHIELD_TARGET: ${{ github.repository }}
+      SHIELD_FAIL_ON: critical   # critical | high | medium | low | none
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
+        with:
+          fetch-depth: 0   # Gitleaks revisa todo el historial de git
+
+      - name: Caché de la base de Trivy
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830   # v4.3.0
+        with:
+          path: ${{ runner.temp }}/trivy-cache   # fuera del repositorio: no se analiza
+          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: trivy-db-${{ runner.os }}-
+
+      # Trivy y Dependency-Check necesitan el package-lock.json. Solo se genera donde falta, sin descargar ni ejecutar nada.
+      - name: Archivos de bloqueo de npm (solo donde falten)
+        run: |
+          find . -name package.json -not -path '*/node_modules/*' -not -path './.git/*' -not -path './.shield-reports/*' | while IFS= read -r f; do
+            d=$(dirname "$f")
+            if [ ! -f "$d/package-lock.json" ] && [ ! -f "$d/yarn.lock" ] && [ ! -f "$d/pnpm-lock.yaml" ]; then
+              echo "Generando $d/package-lock.json"
+              (cd "$d" && npm install --package-lock-only --ignore-scripts --no-audit --no-fund) || echo "No se pudo generar en $d"
+            fi
+          done
+
+      - name: Semgrep
+        run: docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src --entrypoint sh semgrep/semgrep:1.182.0 -c 'mkdir -p .shield-reports && (semgrep scan --config auto --exclude .shield-reports --exclude .dc-data --exclude .trivycache --json --output .shield-reports/semgrep.json || true)'
+
+      - name: Gitleaks
+        run: docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src --entrypoint sh zricethezav/gitleaks:v8.30.1 -c 'mkdir -p .shield-reports && gitleaks detect --source . --report-format json --report-path .shield-reports/gitleaks.json --exit-code 0'
+
+      - name: Trivy
+        run: mkdir -p "$RUNNER_TEMP/trivy-cache" && docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e TRIVY_CACHE_DIR=/cache -v "$RUNNER_TEMP/trivy-cache:/cache" -v "$PWD:/src" -w /src --entrypoint sh aquasec/trivy:0.76.1 -c 'mkdir -p .shield-reports && trivy fs --scanners vuln,secret,misconfig --skip-dirs .shield-reports --skip-dirs .dc-data --skip-dirs .trivycache --format json --output .shield-reports/trivy.json . && trivy fs --skip-dirs .shield-reports --skip-dirs .dc-data --skip-dirs .trivycache --format cyclonedx --output .shield-reports/sbom.cdx.json .'
+
+      - name: Checkov
+        run: docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src --entrypoint sh bridgecrew/checkov:3.3.30 -c 'mkdir -p .shield-reports && checkov --directory . --skip-path .shield-reports --skip-path .dc-data --skip-path .trivycache --output json --soft-fail > .shield-reports/checkov.json'
+
+      - name: Enviar a Shield Dev Radar
+        env:
+          SHIELD_KEY: ${{ secrets.SHIELD_KEY }}
+        run: |
+          curl -sfL "$SHIELD_URL/downloads/shield-import.sh" -o shield-import.sh
+          echo "617b599971ee2400396f799d6184a856e516b6bf486d0b0b0c13a26ca2544cf4  shield-import.sh" | sha256sum -c -   # se detiene si el script no es el original
+          bash shield-import.sh .shield-reports/semgrep.json .shield-reports/gitleaks.json .shield-reports/trivy.json .shield-reports/checkov.json .shield-reports/sbom.cdx.json
